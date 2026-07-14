@@ -205,6 +205,9 @@ get_balance_info_display() {
         "iphash")
             balance_info=" ${BLUE}[IP哈希]${NC}"
             ;;
+        "active-standby")
+            balance_info=" ${GREEN}[主备]${NC}"
+            ;;
         *)
             balance_info=" ${WHITE}[off]${NC}"
             ;;
@@ -2071,9 +2074,10 @@ switch_balance_mode() {
         echo -e "${GREEN}1.${NC} 关闭负载均衡（off）"
         echo -e "${YELLOW}2.${NC} 轮询 (roundrobin)"
         echo -e "${BLUE}3.${NC} IP哈希 (iphash)"
+        echo -e "${GREEN}4.${NC} 主备模式 (active-standby) - 严格主备：1 主 N 备按顺序接替，主恢复后切回主"
         echo ""
 
-        read -p "请输入选择 [1-3]: " mode_choice
+        read -p "请输入选择 [1-4]: " mode_choice
 
         local new_mode=""
         local mode_display=""
@@ -2090,6 +2094,10 @@ switch_balance_mode() {
                 new_mode="iphash"
                 mode_display="IP哈希"
                 ;;
+            4)
+                new_mode="active-standby"
+                mode_display="主备模式"
+                ;;
             *)
                 echo -e "${RED}无效选择${NC}"
                 read -p "按回车键继续..."
@@ -2099,10 +2107,55 @@ switch_balance_mode() {
 
         # 更新选定端口组下所有相关规则的负载均衡模式
         local updated_count=0
+
+        # 计算端口组的目标数（用于把 WEIGHTS 重置为 1,1,1,...）
+        local target_count_for_reset=0
+        if [ -n "${port_groups[$selected_port]}" ]; then
+            IFS=',' read -ra _tc_arr <<< "${port_groups[$selected_port]}"
+            target_count_for_reset=${#_tc_arr[@]}
+        fi
+        # 构造 roundrobin/iphash 用的 1,1,1,... 串
+        local default_weights=""
+        for ((_i=0; _i<target_count_for_reset; _i++)); do
+            if [ -n "$default_weights" ]; then
+                default_weights="$default_weights,1"
+            else
+                default_weights="1"
+            fi
+        done
+        unset _i _tc_arr
+
+        # 是否从 active-standby 切换到其他模式？
+        # active-standby 运行时 WEIGHTS 会被主备逻辑翻成 0/1 列表；
+        # 直接切到 roundrobin/iphash/off 会让这个 0/1 列表被当成普通权重使用，
+        # 造成"健康节点 weight=0"。这里统一重置 WEIGHTS，避免泄漏。
+        local reset_stale_weights=false
+        if [ "$current_balance_mode" = "active-standby" ] && [ "$new_mode" != "active-standby" ]; then
+            reset_stale_weights=true
+        fi
+
         for rule_file in "${RULES_DIR}"/rule-*.conf; do
             if [ -f "$rule_file" ]; then
                 if read_rule_file "$rule_file" && [ "$RULE_ROLE" = "1" ] && [ "$LISTEN_PORT" = "$selected_port" ]; then
                     sed -i "s/^BALANCE_MODE=.*/BALANCE_MODE=\"$new_mode\"/" "$rule_file"
+
+                    # 切出 active-standby 时重置 WEIGHTS / TARGET_STATES
+                    if [ "$reset_stale_weights" = true ]; then
+                        if [ "$new_mode" = "off" ]; then
+                            # 切到 off：与 disable_balance_for_port 一致，清空 WEIGHTS 和 TARGET_STATES
+                            sed -i "s|^TARGET_STATES=.*|TARGET_STATES=\"\"|" "$rule_file"
+                            sed -i "s|^WEIGHTS=.*|WEIGHTS=\"\"|" "$rule_file"
+                        else
+                            # 切到 roundrobin / iphash：重置为 1,1,1...，并清空 TARGET_STATES
+                            sed -i "s|^TARGET_STATES=.*|TARGET_STATES=\"\"|" "$rule_file"
+                            if [ -n "$default_weights" ]; then
+                                sed -i "s|^WEIGHTS=.*|WEIGHTS=\"$default_weights\"|" "$rule_file"
+                            else
+                                sed -i "s|^WEIGHTS=.*|WEIGHTS=\"\"|" "$rule_file"
+                            fi
+                        fi
+                    fi
+
                     updated_count=$((updated_count + 1))
                 fi
             fi
@@ -2292,7 +2345,7 @@ configure_port_group_weights() {
     echo ""
     echo "请输入权重序列 (用逗号分隔):"
     echo -e "${WHITE}格式说明: 按服务器顺序输入权重值，如 \"2,1,3\"${NC}"
-    echo -e "${WHITE}权重范围: 1-10，数值越大分配流量越多${NC}"
+    echo -e "${WHITE}权重范围: 0-10，数值越大分配流量越多 (主备模式可用 \"1,0,0\" 表示仅第一个目标接收流量)${NC}"
     echo ""
 
     read -p "权重序列: " weight_input
@@ -2333,9 +2386,10 @@ validate_weight_input() {
     fi
 
     # 检查权重值范围
+    # 0-10：主备模式（active-standby）允许 0 表示不分配流量
     for weight in "${weights[@]}"; do
-        if [ "$weight" -lt 1 ] || [ "$weight" -gt 10 ]; then
-            echo -e "${RED}权重值 $weight 超出范围，请使用 1-10 之间的数值${NC}"
+        if [ "$weight" -lt 0 ] || [ "$weight" -gt 10 ]; then
+            echo -e "${RED}权重值 $weight 超出范围，请使用 0-10 之间的数值${NC}"
             return 1
         fi
     done

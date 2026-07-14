@@ -202,7 +202,7 @@ toggle_failover_mode() {
             echo ""
             echo -e "${BLUE}故障转移的前提条件：${NC}"
             echo -e "${BLUE}  1. 规则类型为中转服务器${NC}"
-            echo -e "${BLUE}  2. 已启用负载均衡模式（轮询或IP哈希）${NC}"
+            echo -e "${BLUE}  2. 已启用负载均衡模式（轮询/IP哈希/主备）${NC}"
             echo -e "${BLUE}  3. 有多个目标服务器${NC}"
             echo ""
             read -p "按回车键返回..."
@@ -240,6 +240,26 @@ toggle_failover_mode() {
             color="${RED}"
         fi
 
+        # 开启时选择故障转移模式：剔除模式（原有）或 主备模式（新增）
+        local failover_type="legacy"
+        if [ "$new_status" = "true" ]; then
+            echo ""
+            echo -e "${BLUE}请选择故障转移模式:${NC}"
+            echo -e "${GREEN}1.${NC} 剔除模式（原有） - 故障目标从负载均衡列表中移除"
+            echo -e "${BLUE}2.${NC} 主备模式 (active-standby) - 严格主备：1 主 N 备按顺序接替，主恢复后切回主"
+            echo ""
+            read -p "请选择 [1-2] (默认 1): " failover_type_choice
+
+            case "$failover_type_choice" in
+                2)
+                    failover_type="active-standby"
+                    ;;
+                *)
+                    failover_type="legacy"
+                    ;;
+            esac
+        fi
+
         # 直接切换状态，无需确认
         echo -e "${BLUE}正在${action_text}故障转移功能...${NC}"
 
@@ -254,12 +274,27 @@ toggle_failover_mode() {
                     else
                         echo "FAILOVER_ENABLED=\"$new_status\"" >> "$rule_file"
                     fi
+
+                    # 主备模式：同时将该端口下所有规则的 BALANCE_MODE 设为 active-standby
+                    # （保证 generate_endpoints_from_rules 走主备分支，按健康状态翻转权重）
+                    if [ "$new_status" = "true" ] && [ "$failover_type" = "active-standby" ]; then
+                        if grep -q "^BALANCE_MODE=" "$rule_file"; then
+                            sed -i "s/^BALANCE_MODE=.*/BALANCE_MODE=\"active-standby\"/" "$rule_file"
+                        else
+                            echo "BALANCE_MODE=\"active-standby\"" >> "$rule_file"
+                        fi
+                    fi
+
                     updated_count=$((updated_count + 1))
                 fi
             fi
         done
 
         echo -e "${color}✓ 已更新 $updated_count 个规则文件的故障转移状态${NC}"
+
+        if [ "$new_status" = "true" ] && [ "$failover_type" = "active-standby" ]; then
+            echo -e "${BLUE}已选择主备模式 (active-standby): 1 主 N 备按顺序接替${NC}"
+        fi
 
         if [ "$new_status" = "true" ]; then
             echo -e "${BLUE}故障转移参数:${NC}"

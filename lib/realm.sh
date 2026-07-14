@@ -412,6 +412,9 @@ generate_endpoints_from_rules() {
 
     # 第二步：对每个端口组应用故障转移过滤
     for port_key in "${!port_groups[@]}"; do
+        # 读取该端口的负载均衡模式（port_configs 是以 '|' 分隔的字符串，第 5 个字段是 BALANCE_MODE）
+        local port_balance_mode=$(echo "${port_configs[$port_key]}" | awk -F'|' '{print $5}')
+
         # 检查该端口的所有规则，只要有一个启用故障转移就应用过滤
         local failover_enabled="false"
 
@@ -425,66 +428,116 @@ generate_endpoints_from_rules() {
         done
 
         if [ "$failover_enabled" = "true" ]; then
-            # 应用故障转移过滤
             IFS=',' read -ra all_targets <<< "${port_groups[$port_key]}"
-            local filtered_targets=""
-            local filtered_indices=()
 
-            # 记录健康节点的索引位置
-            for i in "${!all_targets[@]}"; do
-                local target="${all_targets[i]}"
-                local host="${target%:*}"
-                local node_status="${health_status[$host]:-healthy}"
+            if [ "$port_balance_mode" = "active-standby" ]; then
+                # 主备模式（active-standby）：保留所有目标在列表中
+                # （健康检查对所有目标独立探测，不依赖权重，因此列表需保持 REMOTE_HOST 原始顺序）
+                # 按顺序找第一个 status=healthy 的目标，权重置 1，其他全 0
+                # 严格主备：主恢复后会自动切回主
+                local first_healthy_index=-1
+                for i in "${!all_targets[@]}"; do
+                    local target="${all_targets[i]}"
+                    local host="${target%:*}"
+                    local node_status="${health_status[$host]:-healthy}"
 
-                if [ "$node_status" != "failed" ]; then
-                    if [ -n "$filtered_targets" ]; then
-                        filtered_targets="$filtered_targets,$target"
-                    else
-                        filtered_targets="$target"
+                    if [ "$node_status" != "failed" ]; then
+                        first_healthy_index=$i
+                        break
                     fi
-                    filtered_indices+=($i)
-                fi
-            done
+                done
 
-            # 如果所有节点都故障，保留第一个节点避免服务完全中断
-            if [ -z "$filtered_targets" ]; then
-                filtered_targets="${all_targets[0]}"
-                filtered_indices=(0)
-            fi
-
-            # 更新端口组为过滤后的目标
-            port_groups[$port_key]="$filtered_targets"
-
-            # 同步调整权重配置以匹配过滤后的目标数量
-            local original_weights="${port_weights[$port_key]}"
-
-            if [ -n "$original_weights" ]; then
-                IFS=',' read -ra weight_array <<< "$original_weights"
-                local adjusted_weights=""
-
-                # 只保留健康节点对应的权重
-                for index in "${filtered_indices[@]}"; do
-                    if [ $index -lt ${#weight_array[@]} ]; then
-                        local weight="${weight_array[index]}"
-                        # 清理权重值（去除空格）
-                        weight=$(echo "$weight" | tr -d ' ')
-                        if [ -n "$adjusted_weights" ]; then
-                            adjusted_weights="$adjusted_weights,$weight"
+                # 主备模式下：所有目标保留在 port_groups 中
+                # 重新生成 0/1 权重列表
+                local flipped_weights=""
+                for i in "${!all_targets[@]}"; do
+                    if [ "$i" -eq "$first_healthy_index" ]; then
+                        if [ -n "$flipped_weights" ]; then
+                            flipped_weights="$flipped_weights,1"
                         else
-                            adjusted_weights="$weight"
+                            flipped_weights="1"
                         fi
                     else
-                        # 如果权重数组长度不足，使用默认权重1
-                        if [ -n "$adjusted_weights" ]; then
-                            adjusted_weights="$adjusted_weights,1"
+                        if [ -n "$flipped_weights" ]; then
+                            flipped_weights="$flipped_weights,0"
                         else
-                            adjusted_weights="1"
+                            flipped_weights="0"
                         fi
                     fi
                 done
 
-                # 更新权重配置
-                port_weights[$port_key]="$adjusted_weights"
+                # 若全部目标都故障（first_healthy_index=-1），上面循环会输出全 0，
+                # 即生成的 realm 配置中所有节点都没有流量——为避免完全断流，强制将第一个目标置 1
+                if [ "$first_healthy_index" -lt 0 ] && [ "${#all_targets[@]}" -gt 0 ]; then
+                    flipped_weights="1"
+                    for ((i=1; i<${#all_targets[@]}; i++)); do
+                        flipped_weights="$flipped_weights,0"
+                    done
+                fi
+
+                # 主备模式：不修改 port_groups（保留所有目标），仅覆写权重
+                port_weights[$port_key]="$flipped_weights"
+            else
+                # 原有剔除模式：从目标列表移除故障节点
+                local filtered_targets=""
+                local filtered_indices=()
+
+                # 记录健康节点的索引位置
+                for i in "${!all_targets[@]}"; do
+                    local target="${all_targets[i]}"
+                    local host="${target%:*}"
+                    local node_status="${health_status[$host]:-healthy}"
+
+                    if [ "$node_status" != "failed" ]; then
+                        if [ -n "$filtered_targets" ]; then
+                            filtered_targets="$filtered_targets,$target"
+                        else
+                            filtered_targets="$target"
+                        fi
+                        filtered_indices+=($i)
+                    fi
+                done
+
+                # 如果所有节点都故障，保留第一个节点避免服务完全中断
+                if [ -z "$filtered_targets" ]; then
+                    filtered_targets="${all_targets[0]}"
+                    filtered_indices=(0)
+                fi
+
+                # 更新端口组为过滤后的目标
+                port_groups[$port_key]="$filtered_targets"
+
+                # 同步调整权重配置以匹配过滤后的目标数量
+                local original_weights="${port_weights[$port_key]}"
+
+                if [ -n "$original_weights" ]; then
+                    IFS=',' read -ra weight_array <<< "$original_weights"
+                    local adjusted_weights=""
+
+                    # 只保留健康节点对应的权重
+                    for index in "${filtered_indices[@]}"; do
+                        if [ $index -lt ${#weight_array[@]} ]; then
+                            local weight="${weight_array[index]}"
+                            # 清理权重值（去除空格）
+                            weight=$(echo "$weight" | tr -d ' ')
+                            if [ -n "$adjusted_weights" ]; then
+                                adjusted_weights="$adjusted_weights,$weight"
+                            else
+                                adjusted_weights="$weight"
+                            fi
+                        else
+                            # 如果权重数组长度不足，使用默认权重1
+                            if [ -n "$adjusted_weights" ]; then
+                                adjusted_weights="$adjusted_weights,1"
+                            else
+                                adjusted_weights="1"
+                            fi
+                        fi
+                    done
+
+                    # 更新权重配置
+                    port_weights[$port_key]="$adjusted_weights"
+                fi
             fi
         fi
     done
@@ -570,8 +623,15 @@ generate_endpoints_from_rules() {
                 done
             fi
 
+            # 主备模式（active-standby）映射为 roundrobin 输出给 realm
+            # realm 自身不识别 active-standby，权重已经是 0/1 列表，roundrobin 即可实现"只有第一个健康节点接收流量"
+            local realm_balance_mode="$balance_mode"
+            if [ "$balance_mode" = "active-standby" ]; then
+                realm_balance_mode="roundrobin"
+            fi
+
             endpoint_config="$endpoint_config,
-            \"balance\": \"$balance_mode: $weight_config\""
+            \"balance\": \"$realm_balance_mode: $weight_config\""
         fi
 
         # 添加through字段（仅中转服务器）
